@@ -4,7 +4,16 @@ package freechips.rocketchip.diplomacy
 
 import freechips.rocketchip.macros.ValNameImpl
 
-case class ValName(name: String)
+/**
+  * Captures the source-level name assigned to a diplomatic object.
+  *
+  * `name` is the historical Rocket Chip API.  `value` mirrors the standalone
+  * Diplomacy API (which uses `sourcecode.Name`) so code ported from that
+  * library can be used without changing the legacy naming materializer.
+  */
+case class ValName(name: String) {
+  def value: String = name
+}
 
 object ValName
 {

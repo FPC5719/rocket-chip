@@ -886,7 +886,7 @@ case class Edges[EI, EO](in: Seq[EI], out: Seq[EO])
   *                                     └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
   * }}}
   */
-sealed abstract class MixedNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data](
+abstract class MixedNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data](
   val inner: InwardNodeImp [DI, UI, EI, BI],
   val outer: OutwardNodeImp[DO, UO, EO, BO])(
   implicit valName: ValName)
