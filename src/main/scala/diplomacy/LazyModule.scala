@@ -331,7 +331,15 @@ sealed trait LazyModuleImpLike extends RawModule {
         dangles
       } .getOrElse {
         // For non-clones, instantiate the child module
-        val mod = Module(c.module)
+        // Preserve the original Chisel exception while adding the diplomatic
+        // hierarchy and source location that identify the failing child.
+        val mod = try {
+          Module(c.module)
+        } catch {
+          case e: ChiselException =>
+            println(s"Chisel exception caught when instantiating ${c.name} within ${this.name} at ${c.line}")
+            throw e
+        }
         mod.dangles
       }
     }
@@ -422,6 +430,15 @@ class LazyRawModuleImp(val wrapper: LazyModule) extends RawModule with LazyModul
   */
 class SimpleLazyModule(implicit p: Parameters) extends LazyModule {
   lazy val module = new LazyModuleImp(this)
+}
+
+/**
+  * A LazyModule wrapper whose implementation is a RawModule.  This is useful
+  * for hierarchy-only wrappers and modules that provide their own clock/reset
+  * wiring, and mirrors standalone Diplomacy without changing SimpleLazyModule.
+  */
+class SimpleLazyRawModule(implicit p: Parameters) extends LazyModule {
+  lazy val module = new LazyRawModuleImp(this)
 }
 
 /** Allows dynamic creation of [[Module]] hierarchy and "shoving" logic into a [[LazyModule]]. */
