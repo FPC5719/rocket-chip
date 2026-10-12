@@ -11,7 +11,7 @@ import org.chipsalliance.cde.config.Parameters
 
 import scala.collection.immutable.{SeqMap, SortedMap}
 import scala.util.matching._
-import scala.reflect.ClassTag
+import scala.reflect.{ClassTag, classTag}
 
 /** While the [[freechips.rocketchip.diplomacy]] package allows fairly abstract parameter negotiation while constructing a DAG,
   * [[LazyModule]] builds on top of the DAG annotated with the negotiated parameters and leverage's Scala's lazy evaluation property to split Chisel module generation into two phases:
@@ -392,6 +392,7 @@ sealed trait LazyModuleImpLike extends RawModule {
         // For non-clones, instantiate the child module
         val mod = c.isCacheable match {
           case Some(ev) =>
+            require(c.moduleCache.isEmpty)
             val m = CacheableModule[ev.T](ev.fresh)(ev.classTag, ev.evidence, sourceInfo)
             c.moduleCache = Some(m)
             m
@@ -494,6 +495,25 @@ class LazyRawModuleImp(
   */
 class SimpleLazyModule(implicit p: Parameters) extends LazyModule {
   lazy val module = new LazyModuleImp(this)
+}
+
+abstract class CacheableModuleImp(
+  wrapper: LazyModule,
+  phase: ElaborationPhase = Defining
+) extends LazyModuleImp(wrapper, phase) with CacheableModule
+
+trait CacheableLazyModule extends LazyModule {
+  type Imp <: CacheableModuleImp
+  protected def cacheableTag: ClassTag[Imp]
+  protected def cacheableKey: CacheableKey[Imp] = new CacheableKey[Imp] {}
+
+  protected def genImp(): Imp =
+    throw new NotImplementedError("Must override either genImp() or genImp(phase)!")
+  protected def genImp(phase: ElaborationPhase): Imp = genImp()
+
+  final override def module: Imp = moduleCache.getOrElse(genImp(Defining)).asInstanceOf[Imp]
+  final override val isCacheable: Option[CacheableEvidence] =
+    Some(CacheableEvidence[Imp](cacheableTag, cacheableKey, genImp))
 }
 
 /** Allows dynamic creation of [[Module]] hierarchy and "shoving" logic into a [[LazyModule]]. */
