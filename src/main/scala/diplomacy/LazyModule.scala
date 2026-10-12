@@ -5,10 +5,12 @@ package freechips.rocketchip.diplomacy
 import chisel3._
 import chisel3.{Module, RawModule, Reset, withClockAndReset}
 import chisel3.experimental.{CloneModuleAsRecord, SourceInfo, UnlocatableSourceInfo}
+import chisel3.experimental.cacheable._
 import org.chipsalliance.cde.config.Parameters
 
 import scala.collection.immutable.{SeqMap, SortedMap}
 import scala.util.matching._
+import scala.reflect.ClassTag
 
 /** While the [[freechips.rocketchip.diplomacy]] package allows fairly abstract parameter negotiation while constructing a DAG,
   * [[LazyModule]] builds on top of the DAG annotated with the negotiated parameters and leverage's Scala's lazy evaluation property to split Chisel module generation into two phases:
@@ -101,6 +103,29 @@ abstract class LazyModule()(implicit val p: Parameters) {
     * Generally, the evaluation of this marks the beginning of phase 2.
     */
   def module: LazyModuleImpLike
+
+  trait CacheableEvidence {
+    type T <: LazyModuleImpLike with CacheableModule
+    def classTag: ClassTag[T]
+    def evidence: CacheableKey[T]
+    def fresh:    () => T
+  }
+
+  object CacheableEvidence {
+    def apply[M <: LazyModuleImpLike with CacheableModule](
+        classTagArg: ClassTag[M],
+        evidenceArg: CacheableKey[M],
+        freshArg:    () => M
+    ): CacheableEvidence = new CacheableEvidence {
+      type T = M
+      val classTag = classTagArg
+      val evidence = evidenceArg
+      val fresh    = freshArg
+    }
+  }
+
+  val isCacheable: Option[CacheableEvidence] = None
+  var moduleCache: Option[LazyModuleImpLike] = None
 
   /** Recursively traverse all child LazyModules and Nodes of this LazyModule
     * to construct the set of empty [[Dangle]]'s that are this module's top-level IO
@@ -331,7 +356,17 @@ sealed trait LazyModuleImpLike extends RawModule {
         dangles
       } .getOrElse {
         // For non-clones, instantiate the child module
-        val mod = Module(c.module)
+        val mod = c.isCacheable match {
+          case Some(ev) =>
+            implicit val evidence: CacheableKey[ev.T] = ev.evidence
+            implicit val classTag: ClassTag[ev.T] = ev.classTag
+            val m = CacheableModule[ev.T](ev.fresh())
+              .asInstanceOf[LazyModuleImpLike]
+            c.moduleCache = Some(m)
+            m
+          case None =>
+            Module(c.module)
+        }
         mod.dangles
       }
     }
