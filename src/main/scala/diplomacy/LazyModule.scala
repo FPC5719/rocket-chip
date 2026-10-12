@@ -5,7 +5,8 @@ package freechips.rocketchip.diplomacy
 import chisel3._
 import chisel3.{Module, RawModule, Reset, withClockAndReset}
 import chisel3.experimental.{CloneModuleAsRecord, SourceInfo, UnlocatableSourceInfo}
-import chisel3.experimental.cacheable._
+import chisel3.experimental.cacheable.{CacheableKey, CacheableModule}
+import CacheableModule.{ElaborationPhase, Defining, Instancing}
 import org.chipsalliance.cde.config.Parameters
 
 import scala.collection.immutable.{SeqMap, SortedMap}
@@ -108,14 +109,14 @@ abstract class LazyModule()(implicit val p: Parameters) {
     type T <: LazyModuleImpLike with CacheableModule
     def classTag: ClassTag[T]
     def evidence: CacheableKey[T]
-    def fresh:    () => T
+    def fresh:    ElaborationPhase => T
   }
 
   object CacheableEvidence {
     def apply[M <: LazyModuleImpLike with CacheableModule](
         classTagArg: ClassTag[M],
         evidenceArg: CacheableKey[M],
-        freshArg:    () => M
+        freshArg:    ElaborationPhase => M
     ): CacheableEvidence = new CacheableEvidence {
       type T = M
       val classTag = classTagArg
@@ -325,9 +326,42 @@ sealed trait LazyModuleImpLike extends RawModule {
   /** [[Parameters]] for chisel [[Module]]s. */
   implicit val p: Parameters = wrapper.p
 
-  /** instantiate this [[LazyModule]],
-    * return [[AutoBundle]] and a unconnected [[Dangle]]s from this module and submodules. */
-  protected[diplomacy] def instantiate(): (AutoBundle, List[Dangle]) = {
+  /** Instantiate this [[LazyModule]],
+    * return [[AutoBundle]] and a unconnected [[Dangle]]s from this module and submodules.
+    *
+    * A cacheable [[LazyModule]] is elaborated twice by [[CacheableModule]]: once to build the
+    * module definition ([[CacheableModule.Defining]]) and once to build the instance stub that the
+    * parent connects to ([[CacheableModule.Instancing]]). Only the definition carries hardware, so
+    * the instance pass must not create children or nodes; it mirrors the definition's ports.
+    */
+  protected[diplomacy] def instantiate(phase: ElaborationPhase): (AutoBundle, List[Dangle]) = {
+    phase match {
+      // The definition was built as a `T <: LazyModuleImpLike`, so this cast is safe.
+      case Instancing(definition) =>
+        instantiateStub(definition.asInstanceOf[LazyModuleImpLike])
+      case Defining =>
+        instantiateFull()
+    }
+  }
+
+  /** Instance elaboration of a cacheable [[LazyModule]]: mirror the definition's [[auto]] port and
+    * rebuild its dangles against that port. [[CacheableModule]] discards the stub's body, so only
+    * the ports matter.
+    */
+  private def instantiateStub(defn: LazyModuleImpLike): (AutoBundle, List[Dangle]) = {
+    require(
+      defn.dangles.size == defn.auto.elements.size,
+      s"${wrapper.name}: ${defn.dangles.size} definition dangles do not match ${defn.auto.elements.size} auto ports"
+    )
+    val auto = IO(chiselTypeOf(defn.auto))
+    val dangles = (defn.dangles zip auto.elements).map { case (d, (_, io)) =>
+      d.copy(dataOpt = Some(io))
+    }.toList
+    (auto, dangles)
+  }
+
+  /** Definition elaboration of this [[LazyModule]]: build children/nodes and punch [[auto]]. */
+  private def instantiateFull(): (AutoBundle, List[Dangle]) = {
     // 1. It will recursively append [[wrapper.children]] into [[chisel3.internal.Builder]],
     // 2. return [[Dangle]]s from each module.
     val childDangles = wrapper.children.reverse.flatMap { c =>
@@ -358,10 +392,7 @@ sealed trait LazyModuleImpLike extends RawModule {
         // For non-clones, instantiate the child module
         val mod = c.isCacheable match {
           case Some(ev) =>
-            implicit val evidence: CacheableKey[ev.T] = ev.evidence
-            implicit val classTag: ClassTag[ev.T] = ev.classTag
-            val m = CacheableModule[ev.T](ev.fresh())
-              .asInstanceOf[LazyModuleImpLike]
+            val m = CacheableModule[ev.T](ev.fresh)(ev.classTag, ev.evidence, sourceInfo)
             c.moduleCache = Some(m)
             m
           case None =>
@@ -425,16 +456,22 @@ sealed trait LazyModuleImpLike extends RawModule {
   *
   * @param wrapper the [[LazyModule]] from which the `.module` call is being made.
   */
-class LazyModuleImp(val wrapper: LazyModule) extends Module with LazyModuleImpLike {
+class LazyModuleImp(
+  val wrapper: LazyModule,
+  phase:       ElaborationPhase = Defining
+) extends Module with LazyModuleImpLike {
   /** Instantiate hardware of this `Module`. */
-  val (auto, dangles) = instantiate()
+  val (auto, dangles) = instantiate(phase)
 }
 
 /** Actual description of a [[RawModule]] which can be instantiated by a call to [[LazyModule.module]].
   *
   * @param wrapper the [[LazyModule]] from which the `.module` call is being made.
   */
-class LazyRawModuleImp(val wrapper: LazyModule) extends RawModule with LazyModuleImpLike {
+class LazyRawModuleImp(
+  val wrapper: LazyModule,
+  phase:       ElaborationPhase = Defining
+) extends RawModule with LazyModuleImpLike {
   // These wires are the default clock+reset for all LazyModule children.
   // It is recommended to drive these even if you manually drive the [[clock]] and [[reset]] of all of the
   // [[LazyRawModuleImp]] children.
@@ -447,7 +484,7 @@ class LazyRawModuleImp(val wrapper: LazyModule) extends RawModule with LazyModul
   childClock := false.B.asClock
   childReset := chisel3.DontCare
   val (auto, dangles) = withClockAndReset(childClock, childReset) {
-    instantiate()
+    instantiate(phase)
   }
 }
 
