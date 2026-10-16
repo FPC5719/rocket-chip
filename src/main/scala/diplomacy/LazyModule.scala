@@ -128,14 +128,30 @@ abstract class LazyModule()(implicit val p: Parameters) {
   val isCacheable: Option[CacheableEvidence] = None
   var moduleCache: Option[LazyModuleImpLike] = None
 
+  /** Whether this LazyModule's instance was elaborated, either in full or as a stub of a cached
+    * definition.
+    *
+    * A [[CacheableLazyModule]] elaborates its definition once, so the children of every other
+    * instance of that definition are never instantiated. Walks that run after elaboration must not
+    * force those children's modules into existence, so they descend only into elaborated subtrees.
+    */
+  private[diplomacy] var wasElaborated: Boolean = false
+
   /** Recursively traverse all child LazyModules and Nodes of this LazyModule
     * to construct the set of empty [[Dangle]]'s that are this module's top-level IO
     * This is effectively doing the same thing as [[LazyModuleImp.instantiate]], but
     * without constructing any [[Module]]'s
+    *
+    * @param requireClones when true (the default), every child must be a clone, as required by
+    *                     [[Clone]]. A cacheable [[LazyModule]] instance also needs this structure,
+    *                     but its children are ordinary (never instantiated) LazyModules, so it
+    *                     passes false.
     */
-  protected[diplomacy] def cloneDangles(): List[Dangle] = {
-    children.foreach(c => require(c.cloneProto.isDefined, s"${c.info}, ${c.parent.get.info}"))
-    val childDangles = children.reverse.flatMap { c => c.cloneDangles() }
+  protected[diplomacy] def cloneDangles(requireClones: Boolean = true): List[Dangle] = {
+    if (requireClones) {
+      children.foreach(c => require(c.cloneProto.isDefined, s"${c.info}, ${c.parent.get.info}"))
+    }
+    val childDangles = children.reverse.flatMap { c => c.cloneDangles(requireClones) }
     val nodeDangles = nodes.reverse.flatMap(n => n.cloneDangles())
     val allDangles = nodeDangles ++ childDangles
     val pairing = SortedMap(allDangles.groupBy(_.source).toSeq: _*)
@@ -210,7 +226,7 @@ abstract class LazyModule()(implicit val p: Parameters) {
       buf ++= s"""$pad      <data key=\"d\">${n.formatNode}, \n${n.nodedebugstring}</data>\n"""
       buf ++= s"""$pad    </node>\n"""
     }
-    children.filter(!_.omitGraphML).foreach(_.nodesGraphML(buf, pad + "    "))
+    children.filter(c => !c.omitGraphML && c.wasElaborated).foreach(_.nodesGraphML(buf, pad + "    "))
     buf ++= s"""$pad  </graph>\n"""
     buf ++= s"""$pad</node>\n"""
   }
@@ -244,7 +260,7 @@ abstract class LazyModule()(implicit val p: Parameters) {
         buf ++= s"""</y:PolyLineEdge></data></edge>\n"""
       }
     }
-    children.filter(!_.omitGraphML).foreach { c => c.edgesGraphML(buf, pad) }
+    children.filter(c => !c.omitGraphML && c.wasElaborated).foreach { c => c.edgesGraphML(buf, pad) }
   }
 
   /** Call function on all of this [[LazyModule]]'s [[children]].
@@ -335,6 +351,7 @@ sealed trait LazyModuleImpLike extends RawModule {
     * the instance pass must not create children or nodes; it mirrors the definition's ports.
     */
   protected[diplomacy] def instantiate(phase: ElaborationPhase): (AutoBundle, List[Dangle]) = {
+    wrapper.wasElaborated = true
     phase match {
       // The definition was built as a `T <: LazyModuleImpLike`, so this cast is safe.
       case Instancing(definition) =>
@@ -347,14 +364,20 @@ sealed trait LazyModuleImpLike extends RawModule {
   /** Instance elaboration of a cacheable [[LazyModule]]: mirror the definition's [[auto]] port and
     * rebuild its dangles against that port. [[CacheableModule]] discards the stub's body, so only
     * the ports matter.
+    *
+    * The dangles must be recomputed from this instance's own nodes rather than reused from the
+    * definition: every instance of a cached definition shares the definition's node identities, so
+    * reusing `defn.dangles` would make all instances report the same [[Dangle.source]] and the
+    * parent would fail to pair each instance with its own counterpart.
     */
   private def instantiateStub(defn: LazyModuleImpLike): (AutoBundle, List[Dangle]) = {
-    require(
-      defn.dangles.size == defn.auto.elements.size,
-      s"${wrapper.name}: ${defn.dangles.size} definition dangles do not match ${defn.auto.elements.size} auto ports"
-    )
     val auto = IO(chiselTypeOf(defn.auto))
-    val dangles = (defn.dangles zip auto.elements).map { case (d, (_, io)) =>
+    val rawDangles = wrapper.cloneDangles(requireClones = false)
+    require(
+      rawDangles.size == auto.elements.size,
+      s"${wrapper.name}: ${rawDangles.size} instance dangles do not match ${auto.elements.size} definition ports"
+    )
+    val dangles = (rawDangles zip auto.elements).map { case (d, (_, io)) =>
       d.copy(dataOpt = Some(io))
     }.toList
     (auto, dangles)
@@ -367,6 +390,7 @@ sealed trait LazyModuleImpLike extends RawModule {
     val childDangles = wrapper.children.reverse.flatMap { c =>
       implicit val sourceInfo: SourceInfo = c.info
       c.cloneProto.map { cp =>
+        c.wasElaborated = true
         // If the child is a clone, then recursively set cloneProto of its children as well
         def assignCloneProtos(bases: Seq[LazyModule], clones: Seq[LazyModule]): Unit = {
           require(bases.size == clones.size)
